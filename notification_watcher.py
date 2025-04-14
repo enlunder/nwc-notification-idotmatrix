@@ -87,22 +87,42 @@ def parse_nwc_notification(content):
 
 # Connects to relay and start watching for notification events
 def watch_for_notifications():
+    env_relays = os.getenv('RELAYS') # None
+    if env_relays is None:
+        env_relays = "wss://relay.damus.io"
+        
+    for relay in env_relays.split(","):
+        print("Adding relay: " + relay)
+        relay_manager.add_relay(relay)
+    
     nwc_string = os.environ['NWC']
-    wallet_service_public_key, relay, secret = extract_parts(nwc_string)
-    private_key = PrivateKey.from_hex(secret)
-    print("Pubkey: " + private_key.public_key.bech32())
-    print("Pubkey (hex): " + private_key.public_key.hex())
-
-    relay_manager = RelayManager(timeout=2)
-    relay_manager.add_relay(relay)
-
+    if nwc_string is not None:
+        wallet_service_public_key, relay, secret = extract_parts(nwc_string)
+        private_key = PrivateKey.from_hex(secret)
+        print("Adding relay: " + relay)        
+        print("Pubkey: " + private_key.public_key.bech32())
+        print("Pubkey (hex): " + private_key.public_key.hex())
+        relay_manager.add_relay(relay)
+        
     start_timestamp = get_timestamp()-10.0
 
-    # According to NIP47, kind 23196 is a notification event. Listen
-    # only for events directed at my public key. 
-    filters = FiltersList( [ Filters(
-        pubkey_refs=[private_key.public_key.hex()],
-        kinds=[23196], limit=1),] )    
+    # The pubkeys we monitor for Zap receipts
+    env_pubkeys = os.getenv('PUBKEYS') 
+
+    # Havingn an empty list gets you all events, so let's include the NWC wallet
+    list_of_pubkeys = [private_key.public_key.hex()]
+    
+    if env_pubkeys is not None:
+        for pubkey in env_pubkeys.split(","):
+            print("Adding pubkey: " + pubkey)
+            list_of_pubkeys.append(PublicKey.from_npub(pubkey).hex())
+    
+    # Listen for NWC notification events (23196) and for Zap receipts for the specificed pubkeys
+    filters = FiltersList(
+        [
+            Filters( pubkey_refs=[private_key.public_key.hex()], kinds=[23196], limit=1),
+            Filters( pubkey_refs=list_of_pubkeys, kinds=[EventKind.ZAPPER], limit=1)]
+    )
     
     # List to store previously seen event ids
     messages_done = []
@@ -135,8 +155,30 @@ def watch_for_notifications():
                                       public_key_hex=public_key.hex())
 
                 result = parse_nwc_notification(msg_decrypted.cleartext_content)
+                print(f"Received notification event: {result}")                
                 message_queue.put(result)
 
+            elif event_msg.event.kind == EventKind.ZAPPER: # According to NIP57, kind 9735 is zap receipt
+                # Extract information from the embedded Zap request
+                request = next(tag for tag in event_msg.event.tags if tag[0] == "description")
+                
+                request_event = Event.from_dict(json.loads(request[1]))
+
+                try: # Only show events where we are able to extract an amount :TODO: this is janky
+                    amount = int(next(tag[1] for tag in request_event.tags if tag[0] == "amount"))
+
+                    if len(request_event.content) > 0:
+                        message = request_event.content.strip()
+                        
+                        # Remove utf characters the screen can't show
+                        iso8859_1_string = message.encode('iso-8859-1', 'ignore').decode('iso-8859-1')
+                        
+                        result = iso8859_1_string + f" %d SATS" % (amount / 1000)
+                        print(f"Received Zap receipt: {result}")
+                        message_queue.put(result)                        
+                except Exception as err:
+                    pass
+            
             # This is not necessary. Kept it here for for debugging purposes
             elif event_msg.event.kind == EventKind.TEXT_NOTE:
                 content = re.sub(r'\b(nostr:)?(nprofile|npub)[0-9a-z]+[\s]*', '', event_msg.event.content)
@@ -145,7 +187,7 @@ def watch_for_notifications():
                     continue
                 
                 print(f"Received public note: {content}")
-            
+                
             gc.collect()
 
         time.sleep(2)
@@ -157,6 +199,7 @@ if __name__ == "__main__":
     consumer_thread.start()
     
     try:
+        relay_manager = RelayManager(timeout=2)
         watch_for_notifications()
     except KeyboardInterrupt:
         running_flag.clear()
